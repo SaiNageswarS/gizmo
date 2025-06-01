@@ -51,6 +51,23 @@ func TestExtractText(t *testing.T) {
 	}
 }
 
+func TestExtractStructuredText(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	blocks, err := ExtractStructuredText(ctx, fixturePDF)
+	if err != nil {
+		t.Fatalf("ExtractStructuredText failed: %v", err)
+	}
+
+	if len(blocks) == 0 {
+		t.Fatal("expected non-empty structured text output")
+	}
+	if blocks[0].HeaderHierarchy == "" || blocks[0].Text == "" {
+		t.Error("expected non-empty header hierarchy and text in structured block")
+	}
+}
+
 func TestGetPageCount(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

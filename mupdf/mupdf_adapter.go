@@ -3,14 +3,17 @@ package mupdf
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -213,4 +216,209 @@ func GetPageCount(ctx context.Context, path string) (int, error) {
 		}
 	}
 	return 0, errors.New("page count not found in info output")
+}
+
+// StructuredBlock represents a chunk of body text and its hierarchical header path.
+//
+// HeaderHierarchy: full path of headers (e.g. "Title | Section | Subsection").
+// Text:            contiguous body paragraph(s) under that header path.
+// PageNumber:      1‑based index of the first page where the text appears.
+//
+// The extraction runs in two passes:
+//   1. Compute dynamic font‑size thresholds for Title / Section / Subsection.
+//   2. Walk blocks again, maintaining the current header stack and emitting body
+//      paragraphs annotated with that hierarchy.
+//
+// Requirements: MuPDF ≥1.21 (`mutool draw -F stext.json`).
+
+type StructuredBlock struct {
+	HeaderHierarchy string `json:"headerHierarchy"`
+	Text            string `json:"text"`
+	PageNumber      int    `json:"pageNumber"`
+}
+
+type stextJSON struct {
+	Pages []struct {
+		Blocks []struct {
+			Type  string `json:"type"`
+			Lines []struct {
+				Font struct {
+					Size float64 `json:"size"`
+				} `json:"font"`
+				Text string `json:"text"`
+			} `json:"lines"`
+		} `json:"blocks"`
+	} `json:"pages"`
+}
+
+// ExtractStructuredText parses pdfPath with MuPDF, derives dynamic header
+// thresholds, and returns aggregated body text blocks annotated with the full
+// header hierarchy.
+func ExtractStructuredText(ctx context.Context, pdfPath string) ([]StructuredBlock, error) {
+	bin, err := discover()
+	if err != nil {
+		return nil, fmt.Errorf("mupdf binary not found: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, bin, "draw", "-F", "stext.json", "-o", "-", pdfPath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("mutool execution failed: %w\n%s", err, out.String())
+	}
+
+	var doc stextJSON
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		return nil, fmt.Errorf("unable to parse stext.json: %w", err)
+	}
+
+	titleSize, sectionSize, subSize, err := computeFontThresholds(&doc)
+	if err != nil {
+		return nil, err
+	}
+
+	classify := func(sz float64) string {
+		switch {
+		case titleSize > 0 && sz >= titleSize:
+			return "Title"
+		case sectionSize > 0 && sz >= sectionSize:
+			return "Section"
+		case subSize > 0 && sz >= subSize:
+			return "Subsection"
+		default:
+			return ""
+		}
+	}
+
+	// Current header context
+	var curTitle, curSection, curSubsection string
+	buildHierarchy := func() string {
+		var parts []string
+		if curTitle != "" {
+			parts = append(parts, curTitle)
+		}
+		if curSection != "" {
+			parts = append(parts, curSection)
+		}
+		if curSubsection != "" {
+			parts = append(parts, curSubsection)
+		}
+		return strings.Join(parts, " | ")
+	}
+
+	// Aggregator state
+	var (
+		aggHierarchy string
+		aggPage      int
+		aggBuilder   strings.Builder
+		blocks       []StructuredBlock
+	)
+	flush := func() {
+		if aggBuilder.Len() == 0 {
+			return
+		}
+		blocks = append(blocks, StructuredBlock{
+			HeaderHierarchy: aggHierarchy,
+			Text:            strings.TrimSpace(aggBuilder.String()),
+			PageNumber:      aggPage,
+		})
+		aggBuilder.Reset()
+	}
+
+	for pageIdx, p := range doc.Pages {
+		for _, blk := range p.Blocks {
+			if blk.Type != "text" {
+				continue
+			}
+
+			var maxSize float64
+			var lineBuilder strings.Builder
+			for _, ln := range blk.Lines {
+				if ln.Font.Size > maxSize {
+					maxSize = ln.Font.Size
+				}
+				t := strings.TrimSpace(ln.Text)
+				if t != "" {
+					lineBuilder.WriteString(t)
+					lineBuilder.WriteString(" ")
+				}
+			}
+			text := strings.TrimSpace(lineBuilder.String())
+			if text == "" {
+				continue
+			}
+
+			switch classify(maxSize) {
+			case "Title":
+				flush()
+				curTitle, curSection, curSubsection = text, "", ""
+			case "Section":
+				flush()
+				curSection, curSubsection = text, ""
+			case "Subsection":
+				flush()
+				curSubsection = text
+			default: // body paragraph
+				hierarchy := buildHierarchy()
+				if hierarchy == "" {
+					// skip body paragraphs before any header is seen
+					continue
+				}
+				if hierarchy != aggHierarchy {
+					// new header context → flush existing aggregate
+					flush()
+					aggHierarchy = hierarchy
+					aggPage = pageIdx + 1
+				}
+				// append paragraph to aggregator (newline‑separated)
+				if aggBuilder.Len() > 0 {
+					aggBuilder.WriteString("\n\n")
+				}
+				aggBuilder.WriteString(text)
+			}
+		}
+	}
+	// flush remaining aggregated text
+	flush()
+
+	return blocks, nil
+}
+
+// computeFontThresholds builds a histogram of rounded font sizes and returns up
+// to the three largest distinct sizes as title, section, and subsection
+// thresholds (missing ones are returned as 0).
+func computeFontThresholds(doc *stextJSON) (title, section, sub float64, err error) {
+	const eps = 0.5
+	freq := map[int]int{}
+
+	for _, p := range doc.Pages {
+		for _, blk := range p.Blocks {
+			if blk.Type != "text" {
+				continue
+			}
+			for _, ln := range blk.Lines {
+				sz := int(math.Round(ln.Font.Size + eps))
+				freq[sz]++
+			}
+		}
+	}
+	if len(freq) == 0 {
+		return 0, 0, 0, fmt.Errorf("no text detected in PDF")
+	}
+
+	var sizes []int
+	for sz := range freq {
+		sizes = append(sizes, sz)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(sizes)))
+
+	switch len(sizes) {
+	case 1:
+		return float64(sizes[0]), 0, 0, nil
+	case 2:
+		return float64(sizes[0]), float64(sizes[1]), 0, nil
+	default:
+		return float64(sizes[0]), float64(sizes[1]), float64(sizes[2]), nil
+	}
 }
