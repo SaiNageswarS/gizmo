@@ -237,20 +237,6 @@ type StructuredBlock struct {
 	PageNumber      int    `json:"pageNumber"`
 }
 
-type stextJSON struct {
-	Pages []struct {
-		Blocks []struct {
-			Type  string `json:"type"`
-			Lines []struct {
-				Font struct {
-					Size float64 `json:"size"`
-				} `json:"font"`
-				Text string `json:"text"`
-			} `json:"lines"`
-		} `json:"blocks"`
-	} `json:"pages"`
-}
-
 // ExtractStructuredText parses pdfPath with MuPDF, derives dynamic header
 // thresholds, and returns aggregated body text blocks annotated with the full
 // header hierarchy.
