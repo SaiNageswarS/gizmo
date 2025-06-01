@@ -1,7 +1,9 @@
 package mupdf
 
+import "encoding/json"
+
 type stextJSON struct {
-	Pages []Page `json:"pages"`
+	Pages []json.RawMessage `json:"pages"`
 }
 
 type Page struct {
